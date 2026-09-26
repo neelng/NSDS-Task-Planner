@@ -1,0 +1,184 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Emails allowed to create their own profile as admin on first sign-in.
+    // Everyone else starts as 'member'; admins promote people from the Admin page.
+    // Keep this in sync with NEXT_PUBLIC_ADMIN_EMAILS.
+    function bootstrapAdmins() {
+      return ['gupt1142@purdue.edu'];
+    }
+
+    // The domain is hardcoded here; keep in sync with NEXT_PUBLIC_ALLOWED_EMAIL_DOMAIN.
+    function signedIn() {
+      return request.auth != null
+        && request.auth.token.email != null
+        && request.auth.token.email_verified == true
+        && request.auth.token.email.lower().matches('.*@purdue[.]edu');
+    }
+
+    function uid() {
+      return request.auth.uid;
+    }
+
+    function userDoc(id) {
+      return /databases/$(database)/documents/users/$(id);
+    }
+
+    function teamDoc(id) {
+      return /databases/$(database)/documents/teams/$(id);
+    }
+
+    function taskDoc(id) {
+      return /databases/$(database)/documents/tasks/$(id);
+    }
+
+    function myRole() {
+      return signedIn() && exists(userDoc(uid())) ? get(userDoc(uid())).data.role : 'none';
+    }
+
+    function isAdmin() {
+      return myRole() == 'admin';
+    }
+
+    function isDirector() {
+      return myRole() == 'director';
+    }
+
+    // True when the caller leads this team or any team above it.
+    function managesTeam(teamId) {
+      return signedIn()
+        && exists(teamDoc(teamId))
+        && uid() in get(teamDoc(teamId)).data.managerIds;
+    }
+
+    // ---------------- users ----------------
+    match /users/{userId} {
+      allow read: if signedIn();
+
+      // First sign-in creates your own profile. You can only be a member, except for
+      // the bootstrap admins above. Everyone else is promoted by an admin later.
+      allow create: if signedIn()
+        && uid() == userId
+        && request.resource.data.keys().hasOnly(['name', 'firstName', 'lastName', 'email', 'photoURL', 'title', 'role', 'hasPassword', 'createdAt'])
+        && request.resource.data.hasPassword == false
+        && request.resource.data.email == request.auth.token.email.lower()
+        && (
+          request.resource.data.role == 'member'
+          || (request.resource.data.role == 'admin'
+              && request.auth.token.email.lower() in bootstrapAdmins())
+        );
+
+      // Admins change anything. Everyone else may only edit their own name/photo, and mark
+      // that they've set a password (true only), never their role or title.
+      allow update: if signedIn() && (
+        isAdmin()
+        || (uid() == userId
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['name', 'firstName', 'lastName', 'photoURL', 'hasPassword'])
+            && (request.resource.data.hasPassword == true
+                || request.resource.data.hasPassword == resource.data.hasPassword))
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // ---------------- teams ----------------
+    match /teams/{teamId} {
+      allow read: if signedIn();
+
+      // Admins create any team. Directors create child teams under a team they lead.
+      // The new team's path and inherited managers are validated against its parent.
+      allow create: if signedIn() && (
+        isAdmin()
+        || (isDirector()
+            && request.resource.data.parentId is string
+            && uid() in get(teamDoc(request.resource.data.parentId)).data.managerIds
+            && request.resource.data.path
+                 == get(teamDoc(request.resource.data.parentId)).data.path.concat([teamId])
+            && request.resource.data.managerIds
+                 == get(teamDoc(request.resource.data.parentId)).data.managerIds
+            && request.resource.data.leadIds.size() == 0)
+      );
+
+      // Admins: anything. Directors: details, leads and members of teams they lead.
+      // Leads: members only. parentId and path can only be changed by admins.
+      allow update: if signedIn() && (
+        isAdmin()
+        || (isDirector()
+            && uid() in resource.data.managerIds
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['name', 'description', 'leadIds', 'managerIds', 'memberIds', 'order']))
+        || (uid() in resource.data.managerIds
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['memberIds']))
+      );
+
+      allow delete: if signedIn() && (
+        isAdmin() || (isDirector() && uid() in resource.data.managerIds)
+      );
+    }
+
+    // ---------------- tasks ----------------
+    // teamPath must always equal the team's real path, so subtree queries can be trusted.
+    function teamFieldsValid(newData, oldData) {
+      return newData.teamId == oldData.teamId
+        ? newData.teamPath == oldData.teamPath
+        : (newData.teamPath == get(teamDoc(newData.teamId)).data.path
+            && (isAdmin() || managesTeam(newData.teamId)));
+    }
+
+    match /tasks/{taskId} {
+      allow read: if signedIn();
+
+      allow create: if signedIn()
+        && request.resource.data.createdBy == uid()
+        && request.resource.data.teamPath == get(teamDoc(request.resource.data.teamId)).data.path
+        && (isAdmin() || managesTeam(request.resource.data.teamId));
+
+      // Full edit: admins, or leads above the task's team.
+      // Progress edit: an assignee, limited to status/progress fields.
+      allow update: if signedIn() && (
+        ((isAdmin() || managesTeam(resource.data.teamId))
+          && request.resource.data.createdBy == resource.data.createdBy
+          && teamFieldsValid(request.resource.data, resource.data))
+        || (uid() in resource.data.assigneeIds
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['status', 'progress', 'updatedAt', 'completedAt']))
+      );
+
+      // Admins anywhere; directors within their own subtree. Leads cannot delete.
+      allow delete: if signedIn() && (
+        isAdmin() || (isDirector() && managesTeam(resource.data.teamId))
+      );
+
+      match /updates/{updateId} {
+        allow read: if signedIn();
+        allow create: if signedIn()
+          && request.resource.data.authorId == uid()
+          && (
+            uid() in get(taskDoc(taskId)).data.assigneeIds
+            || isAdmin()
+            || managesTeam(get(taskDoc(taskId)).data.teamId)
+          );
+        allow update, delete: if isAdmin();
+      }
+    }
+
+    // ---------------- email ----------------
+    match /emailTemplates/{templateId} {
+      allow read: if signedIn() && (isAdmin() || isDirector());
+      allow create: if signedIn()
+        && (isAdmin() || isDirector())
+        && request.resource.data.createdBy == uid();
+      allow update, delete: if signedIn()
+        && (isAdmin() || (isDirector() && resource.data.createdBy == uid()));
+    }
+
+    // Written only by the server (Admin SDK bypasses these rules).
+    match /sentEmails/{sentId} {
+      allow read: if signedIn() && (isAdmin() || resource.data.senderId == uid());
+      allow write: if false;
+    }
+  }
+}
