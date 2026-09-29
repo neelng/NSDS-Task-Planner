@@ -43,3 +43,5 @@ next-env.d.ts
 
 # Firebase service account keys (never commit)
 *firebase-adminsdk*.json
+
+purdue-nsds-task-planner-firebase-adminsdk-fbsvc-9fc3e4aef3.json
